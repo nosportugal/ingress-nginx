@@ -1,0 +1,179 @@
+name: NOS publish (GHCR)
+
+# Builds the CVE-patched nginx base image and the controller image from this
+# fork and publishes them, plus the Helm chart, to GHCR under nosportugal.
+# Manual only: pick a ref (branch or tag) and run it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref of this fork to build
+        default: main
+        required: true
+      build_nginx:
+        description: Rebuild the nginx base image (slow). Untick to reuse nginx_base below.
+        type: boolean
+        default: true
+      nginx_base:
+        description: Existing nginx base reference (repo@sha256:...), used when build_nginx is false
+        required: false
+      chart_suffix:
+        description: Prerelease suffix for the chart version (e.g. nos.1 -> 4.15.7-nos.1)
+        required: true
+        default: nos.1
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/nosportugal/ingress-nginx
+  CHART_REPO: oci://ghcr.io/nosportugal/charts
+
+jobs:
+  nginx:
+    if: inputs.build_nginx
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      base: ${{ steps.ref.outputs.base }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push nginx base
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: images/nginx/rootfs
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.IMAGE_PREFIX }}/nginx:${{ github.sha }}
+
+      - name: Emit base reference
+        id: ref
+        run: echo "base=${IMAGE_PREFIX}/nginx@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  controller:
+    needs: nginx
+    # run when the nginx job succeeded or was skipped on purpose
+    if: ${{ !cancelled() && (needs.nginx.result == 'success' || needs.nginx.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Resolve base image and version
+        id: meta
+        env:
+          BUILT_BASE: ${{ needs.nginx.outputs.base }}
+          GIVEN_BASE: ${{ inputs.nginx_base }}
+        run: |
+          base="${BUILT_BASE:-$GIVEN_BASE}"
+          if [ -z "$base" ]; then
+            echo "No nginx base: build it or pass nginx_base" >&2; exit 1
+          fi
+          case "$base" in *@sha256:*) ;; *) echo "nginx_base must be pinned by digest" >&2; exit 1;; esac
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "version=v$(awk '/^appVersion:/{print $2}' charts/ingress-nginx/Chart.yaml)" >> "$GITHUB_OUTPUT"
+          echo "go=$(cat GOLANG_VERSION)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@7a3fe6cf4cb3a834922a1244abfce67bcef6a0c5 # v6.2.0
+        with:
+          go-version: ${{ steps.meta.outputs.go }}
+          cache: false
+
+      - name: Build binaries
+        env:
+          PKG: k8s.io/ingress-nginx
+          ARCH: amd64
+          TAG: ${{ steps.meta.outputs.version }}
+          COMMIT_SHA: git-${{ github.sha }}
+          REPO_INFO: https://github.com/${{ github.repository }}
+        run: bash build/build.sh
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push controller
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: rootfs
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            BASE_IMAGE=${{ steps.meta.outputs.base }}
+            VERSION=${{ steps.meta.outputs.version }}
+            TARGETARCH=amd64
+            COMMIT_SHA=git-${{ github.sha }}
+            BUILD_ID=${{ github.run_id }}
+          tags: ${{ env.IMAGE_PREFIX }}/controller:${{ steps.meta.outputs.version }}-nos.${{ github.run_number }}
+
+      - name: Emit image reference
+        id: ref
+        run: echo "image=${IMAGE_PREFIX}/controller@${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  chart:
+    needs: controller
+    if: ${{ !cancelled() && needs.controller.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+
+      - name: Package and push chart
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUFFIX: ${{ inputs.chart_suffix }}
+        run: |
+          base=$(awk '/^version:/{print $2}' charts/ingress-nginx/Chart.yaml)
+          helm lint charts/ingress-nginx
+          helm package charts/ingress-nginx --version "${base}-${SUFFIX}" --destination dist
+          echo "$GH_TOKEN" | helm registry login ghcr.io -u "$GH_ACTOR" --password-stdin
+          helm push dist/ingress-nginx-"${base}-${SUFFIX}".tgz "$CHART_REPO"
+
+      - name: Summary
+        env:
+          IMAGE: ${{ needs.controller.outputs.image }}
+          SUFFIX: ${{ inputs.chart_suffix }}
+        run: |
+          {
+            echo "### Published"
+            echo "- controller: \`$IMAGE\`"
+            echo "- chart: \`$CHART_REPO/ingress-nginx:<chart-version>-${SUFFIX}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
