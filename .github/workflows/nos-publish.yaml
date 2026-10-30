@@ -143,6 +143,7 @@ jobs:
 
   chart:
     needs: controller
+    if: ${{ !cancelled() && needs.controller.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
